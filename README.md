@@ -11,7 +11,7 @@ https://fastapi-template.wasmer.app/
 Your FastAPI application exposes a module-level **ASGI** application named `app` in `main.py`:
 
 ```python
-# main.py
+# main_old.py
 from fastapi import FastAPI
 
 app = FastAPI()
@@ -39,7 +39,7 @@ Choose one of the following:
 
 ```bash
 # Option 1: Run the file directly (uses the __main__ block)
-python main.py
+python main_old.py
 ```
 
 ```bash
