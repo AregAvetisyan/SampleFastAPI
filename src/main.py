@@ -1,79 +1,82 @@
-import os, asyncio, logging, httpx, contextlib
-from typing import Optional
-from fastapi import FastAPI
-from contextlib import asynccontextmanager
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+import os
+import logging
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# --- Config & Logging --- #
-logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
-TOKEN, PROXY = os.getenv("TOKEN"), os.getenv("PROXY", "")
-logger = logging.getLogger("bot")
+# ---------------- Logging ---------------- #
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO
+)
 
-# --- Helpers --- #
-async def check_balance(card: str) -> str:
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.post(
-                "https://transport-api.yerevan.am/api/citizen/card-status/",
-                json={"card_number": card}, headers={"Content-Type": "application/json"}
-            ); r.raise_for_status()
-            return str(r.json()["card_status"]["Subscriptions"][0]["TripsLeft"])
-    except Exception:
-        logger.exception("Balance check failed")
-        return "⚠️ Քարտի վրա ակտիվ տոմս չի գտնվել"
+# ---------------- Config ---------------- #
+load_dotenv()
+TOKEN = os.getenv("TOKEN")  # must be set in Wasmer ENV
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://python-bot.wasmer.app/webhook")
 
-def keyboard(saved: Optional[str]) -> ReplyKeyboardMarkup:
-    btns = [[f"💳 Օգտագործել պահված քարտը ({saved})"]] if saved else []
-    btns.append(["▶️ ՍԿՍԵԼ"])
-    return ReplyKeyboardMarkup(btns, resize_keyboard=True)
+# ---------------- FastAPI App ---------------- #
+app = FastAPI()
+telegram_app: Application | None = None
 
-# --- Telegram Handlers --- #
-async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text(
-        "👋 Բարի գալուստ!\nՍեղմեք «ՍԿՍԵԼ» նոր քարտ մուտքագրելու համար կամ ընտրեք պահված քարտը՝ մնացորդը ստանալու համար։",
-        reply_markup=keyboard(c.user_data.get("card"))
-    )
 
-async def ask_card(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    txt, saved = u.message.text, c.user_data.get("card")
-    if txt.startswith("💳") and saved:
-        await u.message.reply_text(f"🔎 Ստուգում եմ քարտի {saved} մնացորդը…")
-        res = await check_balance(saved)
-        await u.message.reply_text(f"💳 Քարտ՝ {saved}\nՄնացորդ՝ {res}", reply_markup=keyboard(saved))
-    elif txt.endswith("ՍԿՍԵԼ"):
-        await u.message.reply_text("Մուտքագրեք ձեր 16-անիշ քարտի համարը։", reply_markup=ReplyKeyboardRemove())
+# ---------------- Bot Handlers ---------------- #
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Hello! I am alive and running on Wasmer with webhook.")
 
-async def handle_card(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    card = u.message.text.strip()
-    if not (card.isdigit() and len(card) == 16):
-        return await u.message.reply_text("❌ Մուտքագրեք վավեր 16-անիշ քարտի համար։")
-    c.user_data["card"] = card
-    await u.message.reply_text("🔎 Ստուգում եմ, խնդրում եմ սպասել…")
-    res = await check_balance(card)
-    await u.message.reply_text(f"💳 Քարտ՝ {card}\nՄնացորդ՝ {res}", reply_markup=keyboard(card))
 
-async def run_bot():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex("ՍԿՍԵԼ|Օգտագործել պահված քարտը"), ask_card))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_card))
-    logger.info("🤖 Telegram bot started…")
-    await app.run_polling()
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"You said: {update.message.text}")
 
-# --- FastAPI with Lifespan --- #
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    task = asyncio.create_task(run_bot())
-    yield
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError): await task
 
-app = FastAPI(lifespan=lifespan)
+# ---------------- Lifespan Events ---------------- #
+@app.on_event("startup")
+async def on_startup():
+    global telegram_app
+    logging.info("🤖 Starting bot in webhook mode…")
 
-@app.get("/")
-async def root(): return {"message": "Bot is running on Wasmer 🚀"}
+    telegram_app = Application.builder().token(TOKEN).build()
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Add handlers
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+    # Set webhook
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"https://api.telegram.org/bot{TOKEN}/setWebhook",
+            params={"url": WEBHOOK_URL},
+        )
+        if resp.status_code == 200:
+            logging.info(f"✅ Webhook set: {WEBHOOK_URL}")
+        else:
+            logging.error(f"❌ Failed to set webhook: {resp.text}")
+
+    logging.info("✅ Application started")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    logging.info("🛑 Application shutdown")
+
+
+# ---------------- Routes ---------------- #
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return {"ok": True}
+
+
+# Healthcheck endpoints (fixes ExitCode::27 on Wasmer)
+@app.api_route("/health", methods=["GET", "HEAD", "POST"])
+async def health():
+    return {"status": "ok", "message": "healthy ✅"}
+
+
+@app.api_route("/", methods=["GET", "HEAD", "POST"])
+async def home():
+    return {"status": "ok", "message": "Telegram bot webhook is running!"}
